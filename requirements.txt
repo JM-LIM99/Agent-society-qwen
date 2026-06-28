@@ -1,0 +1,16 @@
+# Core orchestration
+langgraph>=0.2.0
+langchain>=0.3.0
+langchain-community>=0.3.0
+langchain-groq>=0.2.0
+
+# PDF + chunking
+pypdf>=4.0.0
+
+# Embeddings + vector store
+sentence-transformers>=3.0.0
+langchain-huggingface>=0.1.0
+chromadb>=0.5.0
+
+# Eval / utils
+python-dotenv>=1.0.0
