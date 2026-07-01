@@ -7,19 +7,16 @@ Critic writing `issues`, which routes the graph back to the Reviser.
 """
 from typing import TypedDict, List, Dict
 
-
+# Shared state ()
 class AgentState(TypedDict):
-    # --- Reading phase ---
-    analyses: Dict[str, str]       # section name -> analysis text
-    issues: List[dict]             # Critic-flagged problems (empty = approved)
-    revision_count: int            # guards the Critic<->Reviser loop
-
-    # --- Design phase ---
-    synthesis: str                 # core contributions extracted
-    design: str                    # proposed system design
-    review_feedback: str           # Reviewer's notes
-    design_revision_count: int
-    code: str    # generated code components for the design.
+    paper_text : str
+    analyses: dict
+    critique: dict
+    revisions: int
+    design: str
+    review: str
+    design_revisions: int
+    code: str
 
 
 

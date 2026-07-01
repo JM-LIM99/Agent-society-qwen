@@ -18,215 +18,223 @@ Reviewer        : judge the design; send back if it's weak.
 """
 import json
 from langchain_openai import ChatOpenAI
+from langchain_openai import OpenAIEmbeddings
+import sys
+import os
+import json
+import time
+import re, json, random
+from typing import TypedDict, List
+
+from dotenv import load_dotenv
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_openai import ChatOpenAI
+from langgraph.graph import StateGraph, END
+from .state import AgentState
+from .config import QWEN_API_KEY, QWEN_BASE_URL, LLM_MODEL, JUDGE_MODEL, LLM_CODER
 
 from . import config
 from .state import SECTIONS
 
 
-# --------------------------------------------------------------------------
-# helpers
-# --------------------------------------------------------------------------
-def make_llm():
+load_dotenv()
+
+
+def make_llm(model: str) -> ChatOpenAI:
     return ChatOpenAI(
-        model=config.LLM_MODEL,
-        temperature=config.LLM_TEMPERATURE,
-        api_key=config.QWEN_API_KEY,
-        base_url=config.QWEN_BASE_URL
+        model= model,
+        api_key = QWEN_API_KEY,
+        base_url = QWEN_BASE_URL,
+        temperature = 0, 
+        extra_body = {"enable_thinking": False},
+    )
+# Load paper - no chunk, no embed
+def load_pdf(pdf_path: str) -> str:
+    if not os.path.exists(pdf_path):
+        raise FileNotFoundError(f"PDF not found: {pdf_path}")
+    pages = PyPDFLoader(pdf_path).load()
+    text = "\n\n".join(p.page_content for p in pages)
+    print(f"[load] {len(pages)} pages, {len(text)} chars")
+    return text
+
+llm = make_llm(LLM_MODEL)
+coding = make_llm(LLM_CODER)
+
+def read_section(state: AgentState, role: str) -> dict:
+    """One reader per section. Gets the WHOLE paper, focuses on its role"""
+    paper = state["paper_text"]
+    prompt = (
+        f"You are a research analyst. Read the paper below and analyze ONLY"
+        f"its **{role}**. Be specific and cite concrete details from the text.\n\n"
+        f"=== PAPER ===\n{paper}\n=== END ==="
+    )
+    resp = llm.invoke(prompt).content
+    analyses = dict(state.get("analyses", {}))
+    analyses[role] = resp
+    print(f"[reader:{role}] done ({len(resp)} chars)")
+    return {"analyses": analyses}
+
+def critic(state: AgentState) -> dict:
+    joined = "\n\n".join(f"## {r}\n{t}" for r, t in state["analyses"].items())
+    prompt = (
+        "You are a critic. Check these analyses against the paper for accuracy, "
+        "missing points, and unsupported claims. If they are solid, reply exactly "
+        "'APPROVED'. Otherwise list specific issues to fix.\n\n"
+        f"=== ANALYSES ===\n{joined}"
+    )
+    critique = llm.invoke(prompt).content
+    print(f"[critic] {'APPROVED' if 'APPROVED' in critique else 'needs work'}")
+    return {"critique": critique}
+
+def reviser(state: AgentState) -> dict:
+    joined = "\n\n".join(f"## {r}\n{t}" for r,t in state["analyses"].items()) 
+    prompt = (
+        f"Revise the analyses to fix these issues:\n{state['critique']}\n\n"
+        f"=== CURRENT ANALYSES===\n{joined}\n\n"
+        "Return the corrected analyses, same four sections"
     )
 
+    revised = llm.invoke(prompt).content
+    analyses = dict(state["analyses"])
+    analyses["_reviser"] = revised
+    print(f"[reviser] revision {state.get('revisions', 0) + 1}")
+    return {"analyses": analyses, "revisions": state.get("revisions", 0) + 1}
 
-def _retrieve(retriever, query: str) -> str:
-    """Pull relevant chunks and flatten them into a context string."""
-    docs = retriever.invoke(query)
-    return "\n\n---\n\n".join(d.page_content for d in docs)
+def synthesizer(state: AgentState) -> dict:
+    joined = "\n\n".join(f"## {r}\n{t}" for r, t in state["analyses"].items())
+    prompt = (
+        "Synthesize these analyses into the paper's core contributions. "
+        "You MUST preserve every specific number, hyperparameter, model name, "
+        "dataset, equation, and quantitative result mentioned in the analyses. "
+        "Do not drop them for brevity. Bullet count is not limited if numbers "
+        "would otherwise be lost.\n\n" + joined
+)
+    summary = llm.invoke(prompt).content
+    print("[synthesizer] done")
+    return {"analyses": {**state["analyses"], "_summary": summary}}
+
+EXPLAIN_SYSTEM = (
+    "You explain a research paper in plain, simple language.\n"
+    "Imagine explaining it to a smart friend who is NOT an expert.\n"
+    "Rules:\n"
+    "1. Use only what's in the analyses below. Don't invent numbers or outside facts.\n"
+    "2. Avoid jargon. If you must use a technical term, explain it in one short phrase.\n"
+    "3. Use everyday analogies where they help.\n"
+    "4. Short sentences. No marketing words."
+)
+def explainer(state: AgentState) -> dict:
+    joined = "\n\n".join(f"## {r}\n{t}" for r, t in state["analyses"].items())
+    user = (
+        f"<analyses>\n{joined}\n</analyses>\n\n"
+        "Explain this paper simply:\n"
+        "1. What problem does it solve? (one plain sentence)\n"
+        "2. What's the key idea? (use an analogy if it helps)\n"
+        "3. Why does it matter?\n"
+        "Use ONLY the text above."
+    )
+    explanation = llm.invoke([
+        {"role": "system", "content": EXPLAIN_SYSTEM},
+        {"role": "user", "content": user},
+    ]).content
+    print("[explainer] done")
+    return {"analyses": {**state["analyses"], "_explanation": explanation}}
+
+def architect(state: AgentState) -> dict:
+    summary = state["analyses"].get("_summary", "")
+    feedback = state.get("review", "")
+    extra = f"\nAddress this prior review feedback:\n{feedback}" if feedback else""
+    prompt = (
+        "Based on this paper summary, design a concrete system that implements"
+        "its core method. Give: (1) problem it solves, (2) components"
+        f"(3) data flow.{extra}\n\n=== SUMMARY ===\n{summary}"
+        "use ONLY the summary above. For any detail not in the summary,"
+        f"write '[not specified in summary]'"
+    )
+    design = llm.invoke(prompt).content
+
+    print("[architect] done")
+
+    return {"design": design}
+
+def reviewer(state: AgentState) -> dict:
+    prompt = (
+        "Review this system design for soundness. If solid, reply exactly"
+        "'APPROVED'. Otherwise give specific fixes.\n\n" 
+        + state["design"]
+    )
+    review = llm.invoke(prompt).content
+    print(f"[reviwer] {'APPROVED' if 'APPROVED' in review else 'needs work'}")
+
+    return {"review" : review,
+            "design_revisions": state.get("design_revisions", 0) + 1 }
+
+def coder(state: AgentState) -> dict:
+    prompt = (
+        "Turn this approved design into minimal runnable Python with docstrings "
+        "mapping each part back to the paper's technique.\n\n"
+        "GROUNDING RULES:\n"
+        "- Implement ONLY what the design specifies.\n"
+        "- For any value marked '[not specified in summary]', do NOT invent a number. "
+        "Make it a constructor argument with NO default, or set it to None with a "
+        "comment '# not specified in source'.\n"
+        "- Never write a plausible-looking number and claim it matches the paper.\n\n"
+        f"=== DESIGN ===\n{state['design']}"
+    )
+    code = coding.invoke(prompt).content
+    print("[coder] done")
+    return {"code": code}
+
+def baseline(paper_text: str) -> str:
+    prompt = (
+        "You are an expert researcher. Read this paper, summarize its core"
+        "contributions, and design a system implementing its method.\n\n"
+        f"=== PAPER ===\n{paper_text}"
+    )
+    return make_llm(LLM_MODEL).invoke(prompt).content
+
+def extract_json(raw: str) -> dict:
+    raw = raw.replace("```json", "").replace("```", "").strip()
+    start = raw.find("{")
+    if start == -1:
+        raise json.JSONDecodeError("no object", raw, 0)
+    depth = 0
+    for i in range(start, len(raw)):
+        if raw[i] == "{": depth += 1
+        elif raw[i] == "}":
+            depth -= 1
+            if depth == 0:
+                return json.loads(raw[start:i+1])
+    raise json.JSONDecodeError("unbalanced", raw, 0)
 
 
-def _parse_json(text: str) -> dict:
-    """Strip markdown fences and parse JSON; tolerate model sloppiness."""
-    cleaned = text.strip().removeprefix("```json").removeprefix("```").removesuffix("```").strip()
+def judge(multi: str, base: str, source: str) -> dict:
+    judge_llm = make_llm(JUDGE_MODEL)
+
+    multi_is_a = random.random() < 0.5
+    a, b = (multi, base) if multi_is_a else (base, multi)
+    prompt = (
+        "You are comparing two analyses (A and B) of the SAME source paper.\n"
+        "Judge ONLY against the SOURCE below. Do not reward fluent writing.\n\n"
+        "For EACH analysis, score three axes 1-5:\n"
+        "- completeness: covers key points actually in the source.\n"
+        "- faithfulness: 5 = every specific claim (numbers, hyperparameters, "
+        "architecture details) is supported by the source. Each claim NOT in "
+        "the source subtracts 1. Inventing specs = severe penalty. Correctly "
+        "writing 'not specified' is NOT penalized.\n"
+        "- design_depth: quality of reasoning given only what the source supports.\n\n"
+        f"=== SOURCE ===\n{source}\n\n"
+        f"=== A ===\n{a}\n\n=== B ===\n{b}\n\n"
+        "Reply ONLY JSON:\n"
+        '{"A":{"completeness":x,"faithfulness":x,"design_depth":x},'
+        '"B":{"completeness":x,"faithfulness":x,"design_depth":x}}'
+        )
+    raw = judge_llm.invoke(prompt).content
     try:
-        return json.loads(cleaned)
-    except json.JSONDecodeError:
-        # last resort: grab the outermost braces
-        start, end = cleaned.find("{"), cleaned.rfind("}")
-        if start != -1 and end != -1:
-            return json.loads(cleaned[start:end + 1])
-        raise
-
-
-# --------------------------------------------------------------------------
-# Reader nodes (one factory, four instances)
-# --------------------------------------------------------------------------
-def make_reader(section: str, retriever, llm):
-    """Build a reader node bound to one section."""
-    query = SECTIONS[section]
-
-    def reader(state):
-        context = _retrieve(retriever, query)
-
-        # If this section was previously flagged, fold the feedback in.
-        prior_issue = next(
-            (i for i in state.get("issues", []) if i["section"] == section),
-            None,
-        )
-        feedback = (
-            f"\nA reviewer flagged your previous analysis: {prior_issue['problem']}\n"
-            f"Address this specifically."
-            if prior_issue else ""
-        )
-
-        prompt = (
-            f"You are the **{section}** analyst on a paper-analysis team.\n"
-            f"Using ONLY the excerpts below, write a tight, factual analysis "
-            f"of the paper's {section}. Cite specifics (numbers, names, "
-            f"mechanisms). Do not invent anything not in the text.{feedback}\n\n"
-            f"=== EXCERPTS ===\n{context}\n=== END ===\n\n"
-            f"Analysis of {section}:"
-        )
-        result = llm.invoke(prompt).content
-        # merge into the analyses dict without clobbering siblings
-        analyses = dict(state.get("analyses", {}))
-        analyses[section] = result
-        return {"analyses": analyses}
-
-    return reader
-
-
-# --------------------------------------------------------------------------
-# Critic node  (conflict / consistency check)
-# --------------------------------------------------------------------------
-def make_critic(llm):
-    def critic(state):
-        analyses = state["analyses"]
-        joined = "\n\n".join(f"## {k}\n{v}" for k, v in analyses.items())
-
-        prompt = (
-            "You are the Critic on a paper-analysis team. Below are four "
-            "section analyses written by different agents. Find genuine "
-            "problems: factual contradictions between sections, claims with "
-            "no support, or important gaps.\n\n"
-            "Respond ONLY with JSON in this exact shape:\n"
-            '{"verdict": "approve" | "revise", '
-            '"issues": [{"section": "<background|methodology|experiments|limitations>", '
-            '"problem": "<what is wrong and why>"}]}\n'
-            "If everything is consistent and well-supported, return verdict "
-            '"approve" with an empty issues list. Only flag real problems.\n\n'
-            f"=== ANALYSES ===\n{joined}\n=== END ==="
-        )
-        parsed = _parse_json(llm.invoke(prompt).content)
-        issues = parsed.get("issues", []) if parsed.get("verdict") == "revise" else []
-        return {
-            "issues": issues,
-            "revision_count": state.get("revision_count", 0) + (1 if issues else 0),
-        }
-
-    return critic
-
-
-# --------------------------------------------------------------------------
-# Reviser node  (acts on Critic feedback)
-# --------------------------------------------------------------------------
-def make_reviser(retriever, llm):
-    """Re-run the readers for each flagged section, with feedback attached."""
-    def reviser(state):
-        analyses = dict(state["analyses"])
-        for issue in state["issues"]:
-            section = issue["section"]
-            reader = make_reader(section, retriever, llm)
-            # reader reads `issues` from state to pick up the feedback
-            update = reader({"analyses": analyses, "issues": state["issues"]})
-            analyses.update(update["analyses"])
-        return {"analyses": analyses}
-
-    return reviser
-
-
-# --------------------------------------------------------------------------
-# Synthesizer node
-# --------------------------------------------------------------------------
-def make_synthesizer(llm):
-    def synthesizer(state):
-        analyses = state["analyses"]
-        joined = "\n\n".join(f"## {k}\n{v}" for k, v in analyses.items())
-        prompt = (
-            "You are the Synthesizer. Merge these four validated analyses "
-            "into a crisp statement of the paper's core contributions "
-            "(3-5 bullet points), then one paragraph on what makes the "
-            "approach novel.\n\n"
-            f"=== ANALYSES ===\n{joined}\n=== END ==="
-        )
-        return {"synthesis": llm.invoke(prompt).content}
-
-    return synthesizer
-
-
-# --------------------------------------------------------------------------
-# Architect node
-# --------------------------------------------------------------------------
-def make_architect(llm):
-    def architect(state):
-        feedback = state.get("review_feedback", "")
-        revise_note = (
-            f"\nA reviewer rejected your previous design:\n{feedback}\n"
-            f"Produce an improved version addressing this."
-            if feedback else ""
-        )
-        prompt = (
-            "You are the Architect. Based on the paper's core contributions "
-            "below, propose a concrete system design that APPLIES this "
-            "paper's ideas to a real engineering problem. Include: "
-            "(1) the problem it solves, (2) component breakdown, "
-            "(3) data flow, (4) which paper technique maps to which "
-            f"component.{revise_note}\n\n"
-            f"=== CONTRIBUTIONS ===\n{state['synthesis']}\n=== END ==="
-        )
-        return {"design": llm.invoke(prompt).content}
-
-    return architect
-
-
-# --------------------------------------------------------------------------
-# Reviewer node
-# --------------------------------------------------------------------------
-def make_reviewer(llm):
-    def reviewer(state):
-        prompt = (
-            "You are the Design Reviewer. Judge whether the system design "
-            "below is technically sound, faithful to the paper, and "
-            "actually implementable. Respond ONLY with JSON:\n"
-            '{"verdict": "approve" | "revise", "feedback": "<specific notes>"}\n'
-            "Approve unless there is a real flaw.\n\n"
-            f"=== DESIGN ===\n{state['design']}\n=== END ==="
-        )
-        parsed = _parse_json(llm.invoke(prompt).content)
-        approved = parsed.get("verdict") == "approve"
-        return {
-            "review_feedback": "" if approved else parsed.get("feedback", ""),
-            "design_revision_count": state.get("design_revision_count", 0)
-            + (0 if approved else 1),
-        }
-
-    return reviewer
-
-def make_coder(llm):
-    def coder(state):
-        prompt = (
-            "You are the Coder on the team. The system design below has been "
-            "approved. Produce the KEY Python components that implement it.\n\n"
-            "Requirements:\n"
-            "- Write real, idiomatic Python (not pseudocode).\n"
-            "- Cover the main classes/functions from the design's component "
-            "breakdown — each as a concrete code block.\n"
-            "- Add a short docstring/comment to every class and function "
-            "explaining its role and how it maps to the paper's technique.\n"
-            "- Where a piece needs external logic you won't fully implement, "
-            "leave a clearly marked `# TODO:` with a one-line explanation.\n"
-            "- Start with a one-line summary comment of the module layout.\n\n"
-            "Return ONLY the Python code (no prose around it).\n\n"
-            f"=== CORE CONTRIBUTIONS ===\n{state['synthesis']}\n\n"
-            f"=== APPROVED DESIGN ===\n{state['design']}\n=== END ==="
-        )
-        code = llm.invoke(prompt).content
-        code = code.strip().removeprefix("```python").removeprefix("```").removesuffix("```").strip()
-        return {"code": code}
-    return coder
+        result = extract_json(raw)
+        a_total = sum(result["A"].values())
+        b_total = sum(result["B"].values())
+        result["winner"] = "A" if a_total >= b_total else "B"
+        result["_multi_is"] = "A" if multi_is_a else "B"
+    except (json.JSONDecodeError, KeyError) as e:
+        result = {"error": f"judge parse failed: {e}", "raw": raw}
+    return result

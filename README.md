@@ -17,6 +17,7 @@ doing the same job alone.
 3. **Measurable efficiency gain** — a blind pairwise LLM-as-judge (a *different*
    model) scores the multi-agent output vs a single-agent baseline on
    completeness, faithfulness, and design depth.
+4. **Design-to-code** — once the design is approved, a **Coder** agent turns it into concrete Python components with docstrings mapping each part back to the paper's technique, written to `generated_design.py`.
 
 ## Architecture
 

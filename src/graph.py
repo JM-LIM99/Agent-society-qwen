@@ -26,54 +26,58 @@ The two conditional edges are where "negotiation" lives:
 Both are bounded by revision counters so the graph always terminates.
 """
 from langgraph.graph import StateGraph, START, END
-
-from .state import AgentState, SECTIONS, MAX_REVISIONS, MAX_DESIGN_REVISIONS
-from . import agents
-
-
-def _route_after_critic(state):
-    if state["issues"] and state["revision_count"] <= MAX_REVISIONS:
-        return "reviser"
-    return "synthesizer"
+from .agents import read_section
+from .state import AgentState, MAX_REVISIONS, MAX_DESIGN_REVISIONS
+from .config import READER_ROLES
+from .agents import (
+    critic, reviser, synthesizer,
+    architect, explainer, reviewer, coder,
+)
 
 
-def _route_after_reviewer(state):
-    if state["review_feedback"] and state["design_revision_count"] <= MAX_DESIGN_REVISIONS:
-        return "architect"
-    return "coder"
+def route_after_critic(state: AgentState) -> str:
+    if "APPROVED" in state["critique"]:
+        return "synthesizer"
+    if state.get("revisions", 0) >= MAX_REVISIONS:
+        return "synthesizer"
+    
+    return "reviser"
 
+def route_after_reviewer(state: AgentState) -> str:
+    if "APPROVED" in state["review"]:
+        return "coder"
+    if state.get("design_revisions", 0) >= MAX_DESIGN_REVISIONS:
+        return "coder" 
+    return "architect"
 
-def build_graph(retriever, llm):
+def build_graph():
     g = StateGraph(AgentState)
 
-    # reader nodes (fixed four)
-    for section in SECTIONS:
-        g.add_node(f"read_{section}", agents.make_reader(section, retriever, llm))
+    for role in READER_ROLES:
+        g.add_node(f"read_{role}", lambda s, r= role: read_section(s,r))
+    g.add_node("critic", critic)
+    g.add_node("reviser", reviser)
+    g.add_node("synthesizer", synthesizer)
+    g.add_node("architect", architect)
+    g.add_node("explainer", explainer)
+    g.add_node("reviewer", reviewer)
+    g.add_node("coder", coder)
 
-    g.add_node("critic", agents.make_critic(llm))
-    g.add_node("reviser", agents.make_reviser(retriever, llm))
-    g.add_node("synthesizer", agents.make_synthesizer(llm))
-    g.add_node("architect", agents.make_architect(llm))
-    g.add_node("reviewer", agents.make_reviewer(llm))
-    g.add_node("coder", agents.make_coder(llm))
+    g.set_entry_point("read_background")
+    g.add_edge("read_background", "read_methodology")
+    g.add_edge("read_methodology", "read_experiments")
+    g.add_edge("read_experiments", "read_limitations")
+    g.add_edge("read_limitations", "critic")
 
-    # reading chain (sequential, deterministic order)
-    sections = list(SECTIONS.keys())
-    g.add_edge(START, f"read_{sections[0]}")
-    for a, b in zip(sections, sections[1:]):
-        g.add_edge(f"read_{a}", f"read_{b}")
-    g.add_edge(f"read_{sections[-1]}", "critic")
-
-    # critic <-> reviser loop
-    g.add_conditional_edges("critic", _route_after_critic,
+    g.add_conditional_edges("critic", route_after_critic,
                             {"reviser": "reviser", "synthesizer": "synthesizer"})
     g.add_edge("reviser", "critic")
-
-    # design phase
-    g.add_edge("synthesizer", "architect")
-    g.add_edge("architect", "reviewer")
-    g.add_conditional_edges("reviewer", _route_after_reviewer,
+    g.add_edge("critic", "synthesizer")
+    g.add_edge("synthesizer", "explainer")
+    g.add_edge("explainer", "architect")
+    g.add_conditional_edges("reviewer", route_after_reviewer,
                             {"architect": "architect", "coder": "coder"})
+    g.add_edge("architect", "reviewer")
     g.add_edge("coder", END)
 
     return g.compile()
