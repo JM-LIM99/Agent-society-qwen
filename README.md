@@ -63,7 +63,8 @@ OpenAI directly.
 # put your paper here, e.g. Attention Is All You Need
 #   data/attention.pdf
 
-python -m src.main data/*.pdf   # run society + baseline + judge
+python -m src.main               # auto-picks the first PDF found in data/
+python -m src.main data/foo.pdf  # or run against a specific PDF
 ```
 
 There's no separate embedding/ingest step — the whole paper is passed as
