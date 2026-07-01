@@ -22,9 +22,9 @@ doing the same job alone.
 ## Architecture
 
 ```
-PDF ─► ingest (512-char chunks ─► HF embeddings ─► ChromaDB)
-                                      │
-                                      ▼
+PDF ─► read_pdf
+         │
+         ▼
   read_background ─► read_methodology ─► read_experiments ─► read_limitations
                                       │
                                       ▼
