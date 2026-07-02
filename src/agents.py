@@ -65,7 +65,7 @@ def read_section(state: AgentState, role: str) -> dict:
     paper = state["paper_text"]
     prompt = (
         f"You are a research analyst. Read the paper below and analyze ONLY"
-        f"its **{role}**. Be specific and cite concrete details from the text.\n\n"
+        f"it's **{role}**. Be specific and cite concrete details from the text.\n\n"
         f"=== PAPER ===\n{paper}\n=== END ==="
     )
     resp = llm.invoke(prompt).content
@@ -77,26 +77,44 @@ def read_section(state: AgentState, role: str) -> dict:
 def critic(state: AgentState) -> dict:
     joined = "\n\n".join(f"## {r}\n{t}" for r, t in state["analyses"].items())
     prompt = (
-        "You are a critic. Check these analyses against the paper for accuracy, "
-        "missing points, and unsupported claims. If they are solid, reply exactly "
-        "'APPROVED'. Otherwise list specific issues to fix.\n\n"
+        "You are a critic. Check these analyses against the SOURCE PAPER below "
+        "for accuracy, missing key points (numbers, model names, baselines, "
+        "results), and unsupported claims. If solid, reply exactly 'APPROVED'. "
+        "Otherwise list specific issues to fix.\n\n"
+        f"=== SOURCE PAPER ===\n{state['paper_text']}\n\n"
         f"=== ANALYSES ===\n{joined}"
     )
     critique = llm.invoke(prompt).content
     print(f"[critic] {'APPROVED' if 'APPROVED' in critique else 'needs work'}")
     return {"critique": critique}
 
+def parse_sections(text: str) -> dict:
+    """'## section_name\ntext' 형식을 {section_name: text} 딕셔너리로 파싱"""
+    sections = {}
+    matches = re.split(r"^## +(.+?)\s*$", text, flags=re.MULTILINE)
+    for i in range(1, len(matches) - 1, 2):
+        sections[matches[i].strip()] = matches[i + 1].strip()
+    return sections
+
+
 def reviser(state: AgentState) -> dict:
-    joined = "\n\n".join(f"## {r}\n{t}" for r,t in state["analyses"].items()) 
+    joined = "\n\n".join(f"## {r}\n{t}" for r, t in state["analyses"].items())
     prompt = (
         f"Revise the analyses to fix these issues:\n{state['critique']}\n\n"
-        f"=== CURRENT ANALYSES===\n{joined}\n\n"
-        "Return the corrected analyses, same four sections"
+        f"=== SOURCE PAPER (ground truth) ===\n{state['paper_text']}\n\n"
+        f"=== CURRENT ANALYSES ===\n{joined}\n\n"
+        "Return the corrected analyses using the EXACT same '## section' headers "
+        "(same four sections), no extra commentary. Pull missing specifics "
+        "(numbers, names, results) directly from the source paper."
     )
-
     revised = llm.invoke(prompt).content
+
+    revised_sections = parse_sections(revised)
     analyses = dict(state["analyses"])
-    analyses["_reviser"] = revised
+    for key, text in revised_sections.items():
+        if key in analyses:          
+            analyses[key] = text
+
     print(f"[reviser] revision {state.get('revisions', 0) + 1}")
     return {"analyses": analyses, "revisions": state.get("revisions", 0) + 1}
 
@@ -144,11 +162,14 @@ def architect(state: AgentState) -> dict:
     feedback = state.get("review", "")
     extra = f"\nAddress this prior review feedback:\n{feedback}" if feedback else""
     prompt = (
-        "Based on this paper summary, design a concrete system that implements"
-        "its core method. Give: (1) problem it solves, (2) components"
-        f"(3) data flow.{extra}\n\n=== SUMMARY ===\n{summary}"
-        "use ONLY the summary above. For any detail not in the summary,"
-        f"write '[not specified in summary]'"
+        "Design a concrete system implementing this paper's core method. "
+        f"Give: (1) problem, (2) components, (3) data flow.{extra}\n\n"
+        f"=== SOURCE PAPER (ground truth for all numbers/equations) ===\n"
+        f"{state['paper_text']}\n\n"
+        f"=== VETTED SUMMARY (structure guide) ===\n{summary}\n\n"
+        "Copy equations and numeric values VERBATIM from the source paper. "
+        "If a value is not in the paper, write '[not specified]'. "
+        "Never reconstruct an equation from memory."
     )
     design = llm.invoke(prompt).content
 

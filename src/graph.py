@@ -72,7 +72,6 @@ def build_graph():
     g.add_conditional_edges("critic", route_after_critic,
                             {"reviser": "reviser", "synthesizer": "synthesizer"})
     g.add_edge("reviser", "critic")
-    g.add_edge("critic", "synthesizer")
     g.add_edge("synthesizer", "explainer")
     g.add_edge("explainer", "architect")
     g.add_conditional_edges("reviewer", route_after_reviewer,
