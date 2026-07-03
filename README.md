@@ -1,4 +1,4 @@
-# Agent Society — Paper → System Design
+# Qwen-Powered Agent Society for Document Analysis
 
 Multi-agent collaboration system (Track 3). A society of specialized agents
 reads a research paper (full text, no retrieval), resolves disagreements
